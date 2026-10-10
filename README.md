@@ -2,7 +2,7 @@
 
 A simple web page that tells you whether the next 7 mornings in Perth, WA are good for riding, walking, or staying home for a coffee.
 
-**Live page:** https://YOUR-USERNAME.github.io/YOUR-REPO-NAME/
+**Live page:** [https://YOUR-USERNAME.github.io/YOUR-REPO-NAME/](https://sdigreg.github.io/Weather-check/)
 
 ## What it does
 
