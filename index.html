@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Perth Morning Ride Check</title>
+<style>
+  :root {
+    --bg: #eef0f2; --card: #ffffff; --text: #1d2329; --muted: #5d6873;
+    --ride: #1f8a4c; --walk: #b7791f; --cafe: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14181c; --card: #1f252b; --text: #e8ecef; --muted: #9aa5af;
+      --ride: #4cc380; --walk: #e0a840; --cafe: #ee6b5c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 8px 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 16px; font-size: .95rem; }
+  .rules { color: var(--muted); font-size: .9rem; margin: 0 0 20px; line-height: 1.5; }
+  #status { color: var(--muted); padding: 24px 0; }
+  .day {
+    display: flex; gap: 16px; align-items: center;
+    background: var(--card); border-radius: 12px; padding: 16px;
+    margin-bottom: 12px; border-left: 8px solid var(--muted);
+  }
+  .day.ride { border-left-color: var(--ride); }
+  .day.walk { border-left-color: var(--walk); }
+  .day.cafe { border-left-color: var(--cafe); }
+  /* 200x200 slot: swap the emoji for <img> files later */
+  .icon {
+    flex: 0 0 200px; width: 200px; height: 200px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 110px; line-height: 1;
+  }
+  .icon img { width: 200px; height: 200px; }
+  .info { flex: 1; min-width: 0; }
+  .info h2 { margin: 0 0 4px; font-size: 1.2rem; }
+  .info p { margin: 2px 0; }
+  .verdict { font-weight: 700; margin-top: 8px !important; }
+  .ride .verdict { color: var(--ride); }
+  .walk .verdict { color: var(--walk); }
+  .cafe .verdict { color: var(--cafe); }
+  .muted { color: var(--muted); font-size: .9rem; }
+  @media (max-width: 560px) {
+    .day { flex-direction: column; text-align: center; }
+    .icon { flex-basis: auto; }
+  }
+  footer { color: var(--muted); font-size: .8rem; margin: 16px 0 24px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Perth morning ride check</h1>
+  <p class="sub">6:00 AM to 10:00 AM, next 7 days</p>
+  <p class="rules">Ride: rain chance 20% or less, wind 25 km/h or less.<br>
+  Walk: rain chance 35% or less, wind 30 km/h or less.</p>
+  <div id="status">Loading forecast...</div>
+  <div id="days"></div>
+  <footer id="foot"></footer>
+</main>
+
+<script>
+// ---- Settings (same as the PowerShell script) ----
+const LAT = -31.9505, LON = 115.8605, TZ = "Australia/Perth";
+const CYCLE_RAIN_MAX = 20, CYCLE_WIND_MAX = 25;
+const WALK_RAIN_MAX = 35, WALK_WIND_MAX = 30;
+
+// ---- Big icons: replace each value with '<img src="ride.png" alt="">' etc. later ----
+const ICONS = {
+  ride: "🚴",
+  walk: "👟",
+  cafe: "☕"
+};
+
+function weatherInfo(code) {
+  if (code === 0) return { icon: "☀️", desc: "Clear sky" };
+  if (code === 1) return { icon: "☀️", desc: "Mainly clear" };
+  if (code === 2) return { icon: "⛅", desc: "Partly cloudy" };
+  if (code === 3) return { icon: "☁️", desc: "Overcast" };
+  if ([45, 48].includes(code)) return { icon: "🌫️", desc: "Foggy" };
+  if ([51, 53, 55].includes(code)) return { icon: "🌦️", desc: "Drizzle" };
+  if ([61, 63, 65, 80, 81, 82].includes(code)) return { icon: "🌧️", desc: "Rain" };
+  if ([95, 96, 99].includes(code)) return { icon: "⛈️", desc: "Thunderstorm" };
+  return { icon: "☁️", desc: "Mixed" };
+}
+
+async function fetchWithRetry(url, attempts = 3, delayMs = 2000) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return await res.json();
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts) await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
+const avg = a => a.reduce((s, v) => s + v, 0) / a.length;
+const round1 = n => Math.round(n * 10) / 10;
+
+function dayLabel(dateStr) {
+  const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+  const [y, m, d] = todayStr.split("-").map(Number);
+  const tomorrowStr = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+  if (dateStr === todayStr) return "Today";
+  if (dateStr === tomorrowStr) return "Tomorrow";
+  const [yy, mm, dd] = dateStr.split("-").map(Number);
+  return new Date(Date.UTC(yy, mm - 1, dd)).toLocaleDateString("en-AU",
+    { weekday: "long", day: "numeric", month: "short", timeZone: "UTC" });
+}
+
+async function load() {
+  const status = document.getElementById("status");
+  const url = "https://api.open-meteo.com/v1/forecast" +
+    `?latitude=${LAT}&longitude=${LON}` +
+    "&hourly=temperature_2m,precipitation_probability,wind_speed_10m,wind_gusts_10m,weather_code" +
+    `&wind_speed_unit=kmh&timezone=${TZ}&forecast_days=7`;
+
+  let data;
+  try {
+    data = await fetchWithRetry(url);
+  } catch (e) {
+    status.textContent = "Couldn't load the forecast (" + e.message + "). Check your connection and refresh.";
+    return;
+  }
+
+  const h = data.hourly;
+  const days = {};
+  h.time.forEach((t, i) => {
+    const hour = parseInt(t.slice(11, 13), 10);
+    if (hour < 6 || hour > 9) return;
+    const key = t.slice(0, 10);
+    const d = days[key] || (days[key] = { temps: [], rain: [], wind: [], gust: [], codes: [] });
+    d.temps.push(h.temperature_2m[i]);
+    d.rain.push(h.precipitation_probability[i]);
+    d.wind.push(h.wind_speed_10m[i]);
+    d.gust.push(h.wind_gusts_10m[i]);
+    d.codes.push(h.weather_code[i]);
+  });
+
+  const container = document.getElementById("days");
+  container.innerHTML = "";
+
+  Object.keys(days).sort().forEach(key => {
+    const d = days[key];
+    const maxRain = Math.round(Math.max(...d.rain));
+    const avgWind = round1(avg(d.wind));
+    const maxGust = round1(Math.max(...d.gust));
+    const avgTemp = round1(avg(d.temps));
+
+    // most common weather code
+    const counts = {};
+    d.codes.forEach(c => counts[c] = (counts[c] || 0) + 1);
+    const modeCode = Number(Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0]);
+    const wx = weatherInfo(modeCode);
+
+    const canCycle = maxRain <= CYCLE_RAIN_MAX && avgWind <= CYCLE_WIND_MAX;
+    const canWalk = maxRain <= WALK_RAIN_MAX && avgWind <= WALK_WIND_MAX;
+    let cls, text;
+    if (canCycle) { cls = "ride"; text = "Ride day: get on the bike"; }
+    else if (canWalk) { cls = "walk"; text = "Walking weather: lace up the shoes"; }
+    else { cls = "cafe"; text = "Cafe day: stay home"; }
+
+    const el = document.createElement("div");
+    el.className = "day " + cls;
+    el.innerHTML =
+      `<div class="icon">${ICONS[cls]}</div>` +
+      `<div class="info">` +
+        `<h2>${dayLabel(key)}</h2>` +
+        `<p>${wx.icon} ${wx.desc}, ${avgTemp}°C average</p>` +
+        `<p>💧 Rain: ${maxRain}% peak</p>` +
+        `<p>💨 Wind: ${avgWind} km/h average <span class="muted">(gusts ${maxGust} km/h)</span></p>` +
+        `<p class="verdict">${text}</p>` +
+      `</div>`;
+    container.appendChild(el);
+  });
+
+  status.remove();
+  document.getElementById("foot").textContent =
+    "Source: open-meteo.com. Times are Perth local. Updated " +
+    new Date().toLocaleTimeString("en-AU", { hour: "numeric", minute: "2-digit" });
+}
+
+load();
+</script>
+</body>
+</html>
