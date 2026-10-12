@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Commute Ride Check</title>
+<style>
+  :root {
+    --bg: #eef0f2; --card: #ffffff; --text: #1d2329; --muted: #5d6873;
+    --ride: #1f8a4c; --drive: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14181c; --card: #1f252b; --text: #e8ecef; --muted: #9aa5af;
+      --ride: #4cc380; --drive: #ee6b5c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 8px 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 8px; }
+  .rules { color: var(--muted); font-size: .95rem; margin: 0 0 20px; line-height: 1.5; }
+  #status { color: var(--muted); padding: 24px 0; }
+  h2.date { font-size: 1.25rem; margin: 24px 0 10px; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .card {
+    background: var(--card); border-radius: 12px; padding: 16px;
+    border-top: 8px solid var(--muted); text-align: center;
+  }
+  .card.ride { border-top-color: var(--ride); }
+  .card.drive { border-top-color: var(--drive); }
+  .card.past { opacity: .55; }
+  .icon {
+    width: 200px; height: 200px; margin: 0 auto 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 110px; line-height: 1;
+  }
+  .icon img { width: 200px; height: 200px; }
+  .card h3 { margin: 0; font-size: 1.1rem; }
+  .times { color: var(--muted); font-size: 1rem; margin: 0 0 8px; }
+  .card p { margin: 3px 0; font-size: 1.15rem; }
+  .verdict { font-weight: 700; margin-top: 10px !important; }
+  .ride .verdict { color: var(--ride); }
+  .drive .verdict { color: var(--drive); }
+  .muted { color: var(--muted); font-size: 1rem; }
+  @media (max-width: 560px) {
+    .pair { grid-template-columns: 1fr; }
+  }
+  footer { color: var(--muted); font-size: .85rem; margin: 20px 0 24px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Commute ride check</h1>
+  <p class="sub">Como / South Perth, next 3 days</p>
+  <p class="rules">Ride if rain chance is 20% or less and wind is 25 km/h or less. Otherwise, drive.</p>
+  <div id="status">Loading forecast...</div>
+  <div id="days"></div>
+  <footer id="foot"></footer>
+</main>
+
+<script>
+// ---- Settings ----
+const LAT = -32.003, LON = 115.860, TZ = "Australia/Perth";   // Como
+const FORECAST_DAYS = 3;
+const RAIN_MAX = 20, WIND_MAX = 25;
+
+// Windows use whole hours: from 6 to 8 means the 6am and 7am readings.
+const WINDOWS = [
+  { id: "work", label: "Ride to work", times: "6:00 to 8:00 AM", from: 6, to: 8,
+    ok: "Okay to ride to work", no: "Time to drive: leave the lycra at home" },
+  { id: "home", label: "Ride home", times: "5:00 to 7:00 PM", from: 17, to: 19,
+    ok: "Okay to ride home", no: "Time to drive: the car seat is calling" }
+];
+
+// ---- Big icons: replace each value with '<img src="bike.png" alt="">' etc. later ----
+const ICONS = { ride: "🚴", drive: "🚗" };
+
+function weatherInfo(code) {
+  if (code === 0) return { icon: "☀️", desc: "Clear sky" };
+  if (code === 1) return { icon: "☀️", desc: "Mainly clear" };
+  if (code === 2) return { icon: "⛅", desc: "Partly cloudy" };
+  if (code === 3) return { icon: "☁️", desc: "Overcast" };
+  if ([45, 48].includes(code)) return { icon: "🌫️", desc: "Foggy" };
+  if ([51, 53, 55].includes(code)) return { icon: "🌦️", desc: "Drizzle" };
+  if ([61, 63, 65, 80, 81, 82].includes(code)) return { icon: "🌧️", desc: "Rain" };
+  if ([95, 96, 99].includes(code)) return { icon: "⛈️", desc: "Thunderstorm" };
+  return { icon: "☁️", desc: "Mixed" };
+}
+
+async function fetchWithRetry(url, attempts = 3, delayMs = 2000) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return await res.json();
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts) await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
+const avg = a => a.reduce((s, v) => s + v, 0) / a.length;
+const round1 = n => Math.round(n * 10) / 10;
+
+function perthToday() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+}
+function perthHour() {
+  return parseInt(new Date().toLocaleString("en-GB", { timeZone: TZ, hour: "numeric", hour12: false }), 10) % 24;
+}
+
+function dayLabel(dateStr) {
+  const [y, m, d] = perthToday().split("-").map(Number);
+  const tomorrowStr = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+  if (dateStr === perthToday()) return "Today";
+  if (dateStr === tomorrowStr) return "Tomorrow";
+  const [yy, mm, dd] = dateStr.split("-").map(Number);
+  return new Date(Date.UTC(yy, mm - 1, dd)).toLocaleDateString("en-AU",
+    { weekday: "long", day: "numeric", month: "short", timeZone: "UTC" });
+}
+
+async function load() {
+  const status = document.getElementById("status");
+  const url = "https://api.open-meteo.com/v1/forecast" +
+    `?latitude=${LAT}&longitude=${LON}` +
+    "&hourly=temperature_2m,precipitation_probability,wind_speed_10m,wind_gusts_10m,weather_code" +
+    `&wind_speed_unit=kmh&timezone=${TZ}&forecast_days=${FORECAST_DAYS}`;
+
+  let data;
+  try {
+    data = await fetchWithRetry(url);
+  } catch (e) {
+    status.textContent = "Couldn't load the forecast (" + e.message + "). Check your connection and refresh.";
+    return;
+  }
+
+  const h = data.hourly;
+  const days = {};
+  h.time.forEach((t, i) => {
+    const hour = parseInt(t.slice(11, 13), 10);
+    const win = WINDOWS.find(w => hour >= w.from && hour < w.to);
+    if (!win) return;
+    const key = t.slice(0, 10);
+    const day = days[key] || (days[key] = {});
+    const d = day[win.id] || (day[win.id] = { temps: [], rain: [], wind: [], gust: [], codes: [] });
+    d.temps.push(h.temperature_2m[i]);
+    d.rain.push(h.precipitation_probability[i]);
+    d.wind.push(h.wind_speed_10m[i]);
+    d.gust.push(h.wind_gusts_10m[i]);
+    d.codes.push(h.weather_code[i]);
+  });
+
+  const container = document.getElementById("days");
+  container.innerHTML = "";
+  const today = perthToday(), nowHour = perthHour();
+
+  Object.keys(days).sort().forEach(key => {
+    const section = document.createElement("section");
+    section.innerHTML = `<h2 class="date">${dayLabel(key)}</h2><div class="pair"></div>`;
+    const pair = section.querySelector(".pair");
+
+    WINDOWS.forEach(win => {
+      const d = days[key][win.id];
+      if (!d) return;
+      const maxRain = Math.round(Math.max(...d.rain));
+      const avgWind = round1(avg(d.wind));
+      const maxGust = round1(Math.max(...d.gust));
+      const avgTemp = round1(avg(d.temps));
+
+      const counts = {};
+      d.codes.forEach(c => counts[c] = (counts[c] || 0) + 1);
+      const modeCode = Number(Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0]);
+      const wx = weatherInfo(modeCode);
+
+      const canRide = maxRain <= RAIN_MAX && avgWind <= WIND_MAX;
+      const cls = canRide ? "ride" : "drive";
+      const past = key === today && nowHour >= win.to;
+
+      const el = document.createElement("div");
+      el.className = "card " + cls + (past ? " past" : "");
+      el.innerHTML =
+        `<div class="icon">${ICONS[cls]}</div>` +
+        `<h3>${win.label}</h3>` +
+        `<p class="times">${win.times}${past ? " (already passed)" : ""}</p>` +
+        `<p>${wx.icon} ${wx.desc}, ${avgTemp}°C</p>` +
+        `<p>💧 Rain: ${maxRain}% peak</p>` +
+        `<p>💨 Wind: ${avgWind} km/h <span class="muted">(gusts ${maxGust})</span></p>` +
+        `<p class="verdict">${canRide ? win.ok : win.no}</p>`;
+      pair.appendChild(el);
+    });
+    container.appendChild(section);
+  });
+
+  status.remove();
+  document.getElementById("foot").textContent =
+    "Source: open-meteo.com. Times are Perth local. Updated " +
+    new Date().toLocaleTimeString("en-AU", { hour: "numeric", minute: "2-digit" });
+}
+
+load();
+</script>
+</body>
+</html>
