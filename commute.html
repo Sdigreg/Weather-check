@@ -7,12 +7,12 @@
 <style>
   :root {
     --bg: #eef0f2; --card: #ffffff; --text: #1d2329; --muted: #5d6873;
-    --ride: #1f8a4c; --drive: #c0392b;
+    --ride: #1f8a4c; --drive: #c0392b; --archive: #b7791f;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
       --bg: #14181c; --card: #1f252b; --text: #e8ecef; --muted: #9aa5af;
-      --ride: #4cc380; --drive: #ee6b5c;
+      --ride: #4cc380; --drive: #ee6b5c; --archive: #e0a840;
     }
   }
   * { box-sizing: border-box; }
@@ -25,6 +25,18 @@
   .sub { color: var(--muted); margin: 0 0 8px; }
   .rules { color: var(--muted); font-size: .95rem; margin: 0 0 20px; line-height: 1.5; }
   #status { color: var(--muted); padding: 24px 0; }
+
+  /* The "Archived results" banner that appears when saved numbers are used. */
+  .archive-note {
+    background: var(--card); border-left: 8px solid var(--archive);
+    border-radius: 12px; padding: 14px 16px; margin: 0 0 16px;
+    font-size: 1.02rem; line-height: 1.5;
+  }
+  .archive-note[hidden] { display: none !important; }
+  .archive-note .archive-sub {
+    display: block; color: var(--muted); font-size: .92rem; margin-top: 4px;
+  }
+
   h2.date { font-size: 1.25rem; margin: 24px 0 10px; }
   .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .card {
@@ -58,14 +70,22 @@
   <h1>Commute ride check</h1>
   <p class="sub">Como / South Perth, next 3 days</p>
   <p class="rules">Ride if rain chance is 20% or less and wind is 25 km/h or less. Otherwise, drive.</p>
-  <div id="status">Loading forecast...</div>
+  <div id="status" role="status">Loading forecast...</div>
+  <div id="archiveNote" class="archive-note" hidden></div>
   <div id="days"></div>
   <footer id="foot"></footer>
 </main>
 
 <script>
-// ---- Settings ----
+"use strict";
+
+/* ============================================================
+   1. SETTINGS
+   ============================================================ */
+
 const LAT = -32.003, LON = 115.860, TZ = "Australia/Perth";   // Como
+const LOCATION_NAME = "Como / South Perth";
+
 const FORECAST_DAYS = 3;
 const RAIN_MAX = 20, WIND_MAX = 25;
 
@@ -77,8 +97,77 @@ const WINDOWS = [
     ok: "Okay to ride home", no: "Time to drive: the car seat is calling" }
 ];
 
+/* How long we wait for the weather service, and how many goes we give it.
+   Three tries x 30 seconds. Saved results are only used after all three fail. */
+const REQUEST_TIMEOUT_MS = 30000;   // 30 seconds per try
+const MAX_ATTEMPTS = 3;             // three tries, then fall back
+const RETRY_DELAY_MS = 2000;        // short breather between tries
+
+/* Both pages use the SAME key, so a good run on either page can help the other.
+   Do not change this unless you change it on the main page too. */
+const ARCHIVE_KEY = "perth-morning-weather-archive-v1";
+
+/* Optional shared cloud archive (see README for the 2-minute setup).
+   While `enabled` is false, saved results stay in this browser only.
+   `timeoutMs` is only the wait for that optional cloud copy - the weather
+   service itself gets REQUEST_TIMEOUT_MS (30 seconds) per try. */
+const CLOUD_ARCHIVE = {
+  enabled: false,
+  readUrl: "",
+  writeUrl: "",
+  timeoutMs: 15000
+};
+
+const PAGE_SOURCE = "commute";
+const PAGE_SOURCE_LABEL = "the commute page";
+
 // ---- Big icons: replace each value with '<img src="bike.png" alt="">' etc. later ----
 const ICONS = { ride: "🚴", drive: "🚗" };
+
+/* ============================================================
+   2. SMALL HELPERS
+   ============================================================ */
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function ordinal(n) {
+  const rem100 = n % 100;
+  if (rem100 >= 11 && rem100 <= 13) return n + "th";
+  switch (n % 10) {
+    case 1: return n + "st";
+    case 2: return n + "nd";
+    case 3: return n + "rd";
+    default: return n + "th";
+  }
+}
+
+/* Turns a moment in time into the style used by the banner, e.g.
+   "10th July 2026 - 4:35PM AWST". AWST is always Perth time (GMT+8). */
+function formatAwstStamp(isoString) {
+  const date = isoString ? new Date(isoString) : new Date();
+  if (isNaN(date.getTime())) return "an unknown date";
+  const parts = new Intl.DateTimeFormat("en-AU", {
+    timeZone: TZ, day: "numeric", month: "long", year: "numeric",
+    hour: "numeric", minute: "2-digit", hour12: true
+  }).formatToParts(date);
+  const get = (type) => (parts.find((p) => p.type === type) || {}).value || "";
+  const day = Number(get("day"));
+  const period = get("dayPeriod").replace(/\./g, "").toUpperCase();
+  return `${ordinal(day)} ${get("month")} ${get("year")} - ` +
+         `${get("hour")}:${get("minute")}${period} AWST`;
+}
+
+function formatPerthTime(date) {
+  return date.toLocaleTimeString("en-AU", {
+    hour: "numeric", minute: "2-digit", timeZone: TZ
+  });
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
 
 function weatherInfo(code) {
   if (code === 0) return { icon: "☀️", desc: "Clear sky" };
@@ -92,82 +181,232 @@ function weatherInfo(code) {
   return { icon: "☁️", desc: "Mixed" };
 }
 
-async function fetchWithRetry(url, attempts = 3, delayMs = 2000) {
-  let lastErr;
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      return await res.json();
-    } catch (e) {
-      lastErr = e;
-      if (i < attempts) await new Promise(r => setTimeout(r, delayMs));
-    }
-  }
-  throw lastErr;
+const avg = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+const round1 = (n) => Math.round(n * 10) / 10;
+
+// Current date and hour in Perth, independent of the device's own clock settings
+function perthNow() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", hourCycle: "h23"
+  }).formatToParts(new Date());
+  const get = (type) => parts.find((p) => p.type === type).value;
+  return {
+    date: `${get("year")}-${get("month")}-${get("day")}`,
+    hour: Number(get("hour"))
+  };
 }
 
-const avg = a => a.reduce((s, v) => s + v, 0) / a.length;
-const round1 = n => Math.round(n * 10) / 10;
-
-function perthToday() {
-  return new Date().toLocaleDateString("en-CA", { timeZone: TZ });
-}
-function perthHour() {
-  return parseInt(new Date().toLocaleString("en-GB", { timeZone: TZ, hour: "numeric", hour12: false }), 10) % 24;
-}
-
-function dayLabel(dateStr) {
-  const [y, m, d] = perthToday().split("-").map(Number);
+function dayLabel(dateStr, todayStr) {
+  const [y, m, d] = todayStr.split("-").map(Number);
   const tomorrowStr = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
-  if (dateStr === perthToday()) return "Today";
+  if (dateStr === todayStr) return "Today";
   if (dateStr === tomorrowStr) return "Tomorrow";
   const [yy, mm, dd] = dateStr.split("-").map(Number);
   return new Date(Date.UTC(yy, mm - 1, dd)).toLocaleDateString("en-AU",
     { weekday: "long", day: "numeric", month: "short", timeZone: "UTC" });
 }
 
-async function load() {
-  const status = document.getElementById("status");
-  const url = "https://api.open-meteo.com/v1/forecast" +
-    `?latitude=${LAT}&longitude=${LON}` +
-    "&hourly=temperature_2m,precipitation_probability,wind_speed_10m,wind_gusts_10m,weather_code" +
-    `&wind_speed_unit=kmh&timezone=${TZ}&forecast_days=${FORECAST_DAYS}`;
+/* ============================================================
+   3. TALKING TO THE WEATHER SERVICE (with the 30-second limit)
+   ============================================================ */
 
-  let data;
-  try {
-    data = await fetchWithRetry(url);
-  } catch (e) {
-    status.textContent = "Couldn't load the forecast (" + e.message + "). Check your connection and refresh.";
-    return;
+async function fetchForecast(url, onAttempt, options) {
+  const opts = options || {};
+  const timeoutMs = opts.timeoutMs || REQUEST_TIMEOUT_MS;
+  const attempts = opts.attempts || MAX_ATTEMPTS;
+  const retryDelayMs = opts.retryDelayMs === undefined ? RETRY_DELAY_MS : opts.retryDelayMs;
+
+  let timeoutCount = 0;
+  let lastMessage = "unknown problem";
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
+      if (!response.ok) throw new Error("the weather service said " + response.status);
+      return await response.json();
+    } catch (err) {
+      const timedOut = controller.signal.aborted || (err && err.name === "AbortError");
+      if (timedOut) {
+        timeoutCount++;
+        lastMessage = "it took longer than 30 seconds";
+      } else {
+        lastMessage = err && err.message ? err.message : "unknown problem";
+      }
+      if (attempt < attempts) {
+        if (onAttempt) onAttempt(attempt + 1, timedOut);
+        await sleep(retryDelayMs);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
-  const h = data.hourly;
+  const error = new Error(lastMessage);
+  error.timeouts = timeoutCount;
+  error.attempts = attempts;
+  throw error;
+}
+
+/* ============================================================
+   4. SAVED RESULTS (the fallback)
+   ------------------------------------------------------------
+   On a good run we store the hourly forecast in the browser's
+   own storage, plus a timestamp. If a later run fails three
+   times in a row, we show that saved copy instead.
+   ============================================================ */
+
+function makeArchive(hourly, info) {
+  const now = new Date();
+  return {
+    version: 1,
+    savedAtUtc: now.toISOString(),
+    savedAtLabel: formatAwstStamp(now.toISOString()),
+    source: info.source,
+    sourceLabel: info.sourceLabel,
+    location: {
+      name: info.locationName,
+      lat: info.lat,
+      lon: info.lon,
+      timezone: TZ
+    },
+    forecastDays: info.forecastDays,
+    hourly: {
+      time: Array.from(hourly.time),
+      temperature_2m: Array.from(hourly.temperature_2m),
+      precipitation_probability: Array.from(hourly.precipitation_probability),
+      wind_speed_10m: Array.from(hourly.wind_speed_10m),
+      wind_gusts_10m: Array.from(hourly.wind_gusts_10m),
+      weather_code: Array.from(hourly.weather_code)
+    }
+  };
+}
+
+function isValidArchive(archive) {
+  if (!archive || archive.version !== 1 || !archive.hourly) return false;
+  const h = archive.hourly;
+  if (!Array.isArray(h.time) || h.time.length === 0) return false;
+  const fields = ["temperature_2m", "precipitation_probability",
+                  "wind_speed_10m", "wind_gusts_10m", "weather_code"];
+  return fields.every((field) => Array.isArray(h[field]) && h[field].length === h.time.length);
+}
+
+function saveArchiveLocally(archive) {
+  try {
+    localStorage.setItem(ARCHIVE_KEY, JSON.stringify(archive));
+    return true;
+  } catch (err) {
+    return false;   // private browsing, or storage is full
+  }
+}
+
+function readArchiveLocally() {
+  try {
+    const raw = localStorage.getItem(ARCHIVE_KEY);
+    if (!raw) return null;
+    const archive = JSON.parse(raw);
+    return isValidArchive(archive) ? archive : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function newestArchive(candidates) {
+  const usable = candidates.filter((a) =>
+    isValidArchive(a) && a.savedAtUtc && !isNaN(new Date(a.savedAtUtc).getTime()));
+  if (usable.length === 0) return null;
+  usable.sort((a, b) => new Date(b.savedAtUtc) - new Date(a.savedAtUtc));
+  return usable[0];
+}
+
+/* ---- Optional cloud copy, so the PS1 script and both pages share one file ---- */
+
+async function readArchiveFromCloud() {
+  if (!CLOUD_ARCHIVE.enabled || !CLOUD_ARCHIVE.readUrl) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CLOUD_ARCHIVE.timeoutMs);
+  try {
+    const response = await fetch(CLOUD_ARCHIVE.readUrl, {
+      signal: controller.signal, cache: "no-store"
+    });
+    if (!response.ok) return null;
+    const archive = await response.json();
+    return isValidArchive(archive) ? archive : null;
+  } catch (err) {
+    return null;   // the cloud is optional; never let it break the page
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function writeArchiveToCloud(archive) {
+  if (!CLOUD_ARCHIVE.enabled || !CLOUD_ARCHIVE.writeUrl) return false;
+  const body = JSON.stringify(archive);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CLOUD_ARCHIVE.timeoutMs);
+  try {
+    // "PUT" updates an existing basket; if this is the very first save,
+    // the service may ask us to "POST" it instead.
+    for (const method of ["PUT", "POST"]) {
+      const response = await fetch(CLOUD_ARCHIVE.writeUrl, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body,
+        signal: controller.signal
+      });
+      if (response.ok) return true;
+    }
+    return false;
+  } catch (err) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ============================================================
+   5. SHOWING THE FORECAST
+   ============================================================ */
+
+function buildDays(hourly, now, archived) {
   const days = {};
-  h.time.forEach((t, i) => {
-    const hour = parseInt(t.slice(11, 13), 10);
-    const win = WINDOWS.find(w => hour >= w.from && hour < w.to);
+  hourly.time.forEach((t, i) => {
+    const hour = Number(t.slice(11, 13));
+    const win = WINDOWS.find((w) => hour >= w.from && hour < w.to);
     if (!win) return;
     const key = t.slice(0, 10);
+    if (key < now.date) return;   // yesterday and older
     const day = days[key] || (days[key] = {});
     const d = day[win.id] || (day[win.id] = { temps: [], rain: [], wind: [], gust: [], codes: [] });
-    d.temps.push(h.temperature_2m[i]);
-    d.rain.push(h.precipitation_probability[i]);
-    d.wind.push(h.wind_speed_10m[i]);
-    d.gust.push(h.wind_gusts_10m[i]);
-    d.codes.push(h.weather_code[i]);
+    d.temps.push(hourly.temperature_2m[i]);
+    d.rain.push(hourly.precipitation_probability[i]);
+    d.wind.push(hourly.wind_speed_10m[i]);
+    d.gust.push(hourly.wind_gusts_10m[i]);
+    d.codes.push(hourly.weather_code[i]);
   });
+  return days;
+}
+
+function renderDays(hourly, options) {
+  const archived = !!(options && options.archived);
+  const now = perthNow();
+  const nowHour = now.hour;
+  const days = buildDays(hourly, now, archived);
+  const keys = Object.keys(days).sort();
 
   const container = document.getElementById("days");
   container.innerHTML = "";
-  const today = perthToday(), nowHour = perthHour();
+  if (keys.length === 0) return 0;
 
-  Object.keys(days).sort().forEach(key => {
+  keys.forEach((key) => {
     const section = document.createElement("section");
-    section.innerHTML = `<h2 class="date">${dayLabel(key)}</h2><div class="pair"></div>`;
+    section.innerHTML = `<h2 class="date">${dayLabel(key, now.date)}</h2><div class="pair"></div>`;
     const pair = section.querySelector(".pair");
 
-    WINDOWS.forEach(win => {
+    WINDOWS.forEach((win) => {
       const d = days[key][win.id];
       if (!d) return;
       const maxRain = Math.round(Math.max(...d.rain));
@@ -176,13 +415,13 @@ async function load() {
       const avgTemp = round1(avg(d.temps));
 
       const counts = {};
-      d.codes.forEach(c => counts[c] = (counts[c] || 0) + 1);
+      d.codes.forEach((c) => counts[c] = (counts[c] || 0) + 1);
       const modeCode = Number(Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0]);
       const wx = weatherInfo(modeCode);
 
       const canRide = maxRain <= RAIN_MAX && avgWind <= WIND_MAX;
       const cls = canRide ? "ride" : "drive";
-      const past = key === today && nowHour >= win.to;
+      const past = key === now.date && nowHour >= win.to;
 
       const el = document.createElement("div");
       el.className = "card " + cls + (past ? " past" : "");
@@ -199,10 +438,125 @@ async function load() {
     container.appendChild(section);
   });
 
+  return keys.length;
+}
+
+function showArchiveNote(archive, noUsableDays) {
+  const el = document.getElementById("archiveNote");
+  const stamp = archive.savedAtLabel || formatAwstStamp(archive.savedAtUtc);
+  const from = archive.sourceLabel ? ` Saved by ${archive.sourceLabel}.` : "";
+  const sub = noUsableDays
+    ? "These saved numbers are too old to show any upcoming days."
+    : `The live forecast couldn't be reached after ${MAX_ATTEMPTS} tries. ` +
+      `These are the last good numbers we have.${from}`;
+
+  el.innerHTML =
+    `<strong>Archived results:</strong> Last ran on ${escapeHtml(stamp)}` +
+    `<span class="archive-sub">${escapeHtml(sub)}</span>`;
+  el.hidden = false;
+}
+
+function showFailure(status, err) {
+  const timedOut = err && err.timeouts > 0;
+  status.textContent = timedOut
+    ? `The weather service didn't answer within 30 seconds, ${MAX_ATTEMPTS} times in a row. ` +
+      `There are no saved results to fall back on yet, so please try again later.`
+    : `Couldn't load the forecast (${err && err.message ? err.message : "unknown error"}). ` +
+      `Check your internet connection and refresh. There are no saved results to fall back on yet.`;
+}
+
+/* ---- Footer: a quiet note about where the numbers came from ---- */
+let localSaveState = "none";   // "none" | "saved" | "failed"
+let cloudSaveState = "off";    // "off" | "pending" | "ok" | "failed"
+
+function updateFooter(archived) {
+  const bits = ["Source: open-meteo.com. Times are Perth local. Updated " + formatPerthTime(new Date())];
+  if (archived) {
+    bits.push("showing saved results");
+  } else if (localSaveState === "saved") {
+    bits.push("saved for next time");
+  }
+  if (CLOUD_ARCHIVE.enabled) {
+    if (cloudSaveState === "ok") bits.push("shared archive updated");
+    else if (cloudSaveState === "failed") bits.push("shared archive not updated");
+    else if (cloudSaveState === "pending") bits.push("updating shared archive…");
+  }
+  document.getElementById("foot").textContent = bits.join(" · ");
+}
+
+/* ============================================================
+   6. THE RUN
+   ============================================================ */
+
+const API_URL = "https://api.open-meteo.com/v1/forecast" +
+  `?latitude=${LAT}&longitude=${LON}` +
+  "&hourly=temperature_2m,precipitation_probability,wind_speed_10m,wind_gusts_10m,weather_code" +
+  `&wind_speed_unit=kmh&timezone=${TZ}&forecast_days=${FORECAST_DAYS}`;
+
+async function load() {
+  const status = document.getElementById("status");
+  let hourly = null;
+  let archived = null;
+
+  try {
+    const data = await fetchForecast(API_URL, (nextAttempt, timedOut) => {
+      status.textContent = timedOut
+        ? `Taking longer than 30 seconds. Trying again (${nextAttempt} of ${MAX_ATTEMPTS})…`
+        : `Couldn't reach the weather service. Trying again (${nextAttempt} of ${MAX_ATTEMPTS})…`;
+    });
+
+    hourly = data && data.hourly;
+    if (!hourly || !Array.isArray(hourly.time) || hourly.time.length === 0) {
+      throw new Error("the forecast came back empty");
+    }
+
+    // Good run: keep a copy before we show anything.
+    const archive = makeArchive(hourly, {
+      source: PAGE_SOURCE,
+      sourceLabel: PAGE_SOURCE_LABEL,
+      locationName: LOCATION_NAME,
+      lat: LAT,
+      lon: LON,
+      forecastDays: FORECAST_DAYS
+    });
+    localSaveState = saveArchiveLocally(archive) ? "saved" : "failed";
+
+    if (CLOUD_ARCHIVE.enabled) {
+      cloudSaveState = "pending";
+      updateFooter(false);
+      writeArchiveToCloud(archive).then((ok) => {
+        cloudSaveState = ok ? "ok" : "failed";
+        updateFooter(false);
+      });
+    }
+
+    status.remove();
+    const shown = renderDays(hourly, { archived: false });
+
+    if (shown === 0) {
+      const note = document.createElement("p");
+      note.className = "note";
+      note.textContent = "The forecast didn't include any commute hours. Please try again later.";
+      document.getElementById("days").appendChild(note);
+    }
+
+    updateFooter(false);
+    return;
+  } catch (err) {
+    // Failed all three tries: look for the newest saved copy we can find.
+    archived = newestArchive([readArchiveLocally(), await readArchiveFromCloud()]);
+
+    if (!archived) {
+      showFailure(status, err);
+      return;
+    }
+    hourly = archived.hourly;
+  }
+
   status.remove();
-  document.getElementById("foot").textContent =
-    "Source: open-meteo.com. Times are Perth local. Updated " +
-    new Date().toLocaleTimeString("en-AU", { hour: "numeric", minute: "2-digit" });
+  const shown = renderDays(hourly, { archived: true });
+  showArchiveNote(archived, shown === 0);
+  updateFooter(true);
 }
 
 load();
